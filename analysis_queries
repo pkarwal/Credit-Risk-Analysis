@@ -1,0 +1,260 @@
+-- Query 1: Default Rate by Loan Grade
+
+SELECT
+    grade,
+    COUNT(*)                                                        AS total_loans,
+    SUM(CASE WHEN loan_status IN ('Charged Off','Default') THEN 1 ELSE 0 END)
+                                                                    AS defaults,
+    ROUND(
+        100.0 * SUM(CASE WHEN loan_status IN ('Charged Off','Default') THEN 1 ELSE 0 END)
+        / COUNT(*), 2
+    )                                                               AS default_rate_pct,
+    ROUND(AVG(interest_rate), 2)                                    AS avg_interest_rate,
+    ROUND(AVG(loan_amount), 0)                                      AS avg_loan_amount
+FROM loans
+GROUP BY grade
+ORDER BY grade;
+
+
+-- ── Query 2: Borrower Risk Segmentation using DTI & Credit Score 
+-- Business question: How do we classify borrowers into risk tiers?
+-- Skills: CASE WHEN risk tiers, JOIN, multi-column aggregation
+
+SELECT
+    CASE
+        WHEN ch.debt_to_income < 10 AND ch.credit_score >= 740 THEN 'Low Risk'
+        WHEN ch.debt_to_income < 20 AND ch.credit_score >= 680 THEN 'Medium Risk'
+        WHEN ch.debt_to_income < 35 AND ch.credit_score >= 620 THEN 'High Risk'
+        ELSE 'Very High Risk'
+    END                                                             AS risk_tier,
+    COUNT(DISTINCT b.borrower_id)                                   AS borrower_count,
+    ROUND(AVG(b.annual_income), 0)                                  AS avg_income,
+    ROUND(AVG(ch.debt_to_income), 1)                                AS avg_dti,
+    ROUND(AVG(ch.credit_score), 0)                                  AS avg_credit_score,
+    ROUND(AVG(ch.revolving_utilization), 1)                         AS avg_rev_utilization_pct,
+    SUM(CASE WHEN l.loan_status IN ('Charged Off','Default') THEN 1 ELSE 0 END)
+                                                                    AS total_defaults,
+    ROUND(
+        100.0 * SUM(CASE WHEN l.loan_status IN ('Charged Off','Default') THEN 1 ELSE 0 END)
+        / COUNT(l.loan_id), 2
+    )                                                               AS default_rate_pct
+FROM borrowers b
+JOIN credit_history ch ON b.borrower_id = ch.borrower_id
+JOIN loans l            ON b.borrower_id = l.borrower_id
+GROUP BY risk_tier
+ORDER BY default_rate_pct DESC;
+
+
+-- ── Query 3: Default Rate by Loan Purpose ────────────────────────────────────
+-- Business question: Which loan purposes are highest risk?
+-- Skills: GROUP BY, HAVING, calculated rates
+
+SELECT
+    loan_purpose,
+    COUNT(*)                                                        AS total_loans,
+    ROUND(AVG(loan_amount), 0)                                      AS avg_loan_amount,
+    ROUND(AVG(interest_rate), 2)                                    AS avg_rate,
+    SUM(CASE WHEN loan_status IN ('Charged Off','Default') THEN 1 ELSE 0 END)
+                                                                    AS defaults,
+    ROUND(
+        100.0 * SUM(CASE WHEN loan_status IN ('Charged Off','Default') THEN 1 ELSE 0 END)
+        / COUNT(*), 2
+    )                                                               AS default_rate_pct
+FROM loans
+GROUP BY loan_purpose
+HAVING COUNT(*) > 50                          -- filter low-volume purposes
+ORDER BY default_rate_pct DESC;
+
+
+-- ── Query 4: Income Band Analysi
+-- Business question: Does higher income mean lower default risk?
+-- Skills: CASE WHEN bucketing, three-table JOIN, aggregation
+
+SELECT
+    CASE
+        WHEN b.annual_income < 40000  THEN '< $40K'
+        WHEN b.annual_income < 60000  THEN '$40K–$60K'
+        WHEN b.annual_income < 80000  THEN '$60K–$80K'
+        WHEN b.annual_income < 100000 THEN '$80K–$100K'
+        WHEN b.annual_income < 150000 THEN '$100K–$150K'
+        ELSE '$150K+'
+    END                                                             AS income_band,
+    COUNT(DISTINCT b.borrower_id)                                   AS borrower_count,
+    ROUND(AVG(l.loan_amount), 0)                                    AS avg_loan_amount,
+    ROUND(AVG(ch.debt_to_income), 1)                                AS avg_dti,
+    ROUND(
+        100.0 * SUM(CASE WHEN l.loan_status IN ('Charged Off','Default') THEN 1 ELSE 0 END)
+        / COUNT(l.loan_id), 2
+    )                                                               AS default_rate_pct
+FROM borrowers b
+JOIN loans l            ON b.borrower_id = l.borrower_id
+JOIN credit_history ch  ON b.borrower_id = ch.borrower_id
+GROUP BY income_band
+ORDER BY MIN(b.annual_income);
+
+
+-- ── Query 5: CTE — Clean Feature Table for ML Model \
+-- Business question: Build a single flat table of features for model input
+-- Skills: CTE (WITH), multi-table JOIN, feature engineering
+
+WITH loan_defaults AS (
+    SELECT
+        loan_id,
+        borrower_id,
+        loan_amount,
+        interest_rate,
+        term_months,
+        grade,
+        loan_purpose,
+        CASE WHEN loan_status IN ('Charged Off','Default') THEN 1 ELSE 0 END AS is_default
+    FROM loans
+),
+repayment_summary AS (
+    SELECT
+        loan_id,
+        COUNT(*)                            AS total_payments,
+        AVG(days_past_due)                  AS avg_days_past_due,
+        SUM(late_fee)                       AS total_late_fees,
+        SUM(CASE WHEN days_past_due > 0 THEN 1 ELSE 0 END)
+                                            AS late_payment_count
+    FROM repayments
+    GROUP BY loan_id
+)
+
+SELECT
+    ld.loan_id,
+    ld.is_default,
+
+    -- Borrower features
+    b.age,
+    b.annual_income,
+    b.employment_years,
+    b.home_ownership,
+
+    -- Credit features
+    ch.credit_score,
+    ch.debt_to_income,
+    ch.revolving_utilization,
+    ch.delinquencies_2yr,
+    ch.open_accounts,
+    ch.public_records,
+
+    -- Loan features
+    ld.loan_amount,
+    ld.interest_rate,
+    ld.term_months,
+    ld.grade,
+    ld.loan_purpose,
+
+    -- Engineered features
+    ROUND(ld.loan_amount / NULLIF(b.annual_income, 0), 4)
+                                            AS loan_to_income_ratio,
+    ROUND(ld.interest_rate - (
+        SELECT AVG(interest_rate) FROM loans WHERE grade = ld.grade
+    ), 2)                                   AS rate_vs_grade_avg,
+
+    -- Repayment behaviour features
+    COALESCE(rs.avg_days_past_due, 0)       AS avg_days_past_due,
+    COALESCE(rs.late_payment_count, 0)      AS late_payment_count,
+    COALESCE(rs.total_late_fees, 0)         AS total_late_fees
+
+FROM loan_defaults ld
+JOIN borrowers b        ON ld.borrower_id = b.borrower_id
+JOIN credit_history ch  ON ld.borrower_id = ch.borrower_id
+LEFT JOIN repayment_summary rs ON ld.loan_id = rs.loan_id
+ORDER BY ld.loan_id;
+
+
+-- ── Query 6: Window Function — Ranking Borrowers Within Risk Tier 
+-- Business question: Who are the top 10 riskiest borrowers per risk tier?
+-- Skills: Window functions (RANK, PARTITION BY), CTE
+
+WITH scored AS (
+    SELECT
+        b.borrower_id,
+        b.annual_income,
+        ch.credit_score,
+        ch.debt_to_income,
+        ch.delinquencies_2yr,
+        ch.revolving_utilization,
+        CASE
+            WHEN ch.debt_to_income < 10 AND ch.credit_score >= 740 THEN 'Low Risk'
+            WHEN ch.debt_to_income < 20 AND ch.credit_score >= 680 THEN 'Medium Risk'
+            WHEN ch.debt_to_income < 35 AND ch.credit_score >= 620 THEN 'High Risk'
+            ELSE 'Very High Risk'
+        END                                 AS risk_tier,
+        -- Simple risk score: higher = riskier
+        ROUND(
+            (ch.debt_to_income * 0.3)
+            + (ch.revolving_utilization * 0.25)
+            + (ch.delinquencies_2yr * 15)
+            + ((850 - ch.credit_score) * 0.1), 2
+        )                                   AS risk_score
+    FROM borrowers b
+    JOIN credit_history ch ON b.borrower_id = ch.borrower_id
+)
+
+SELECT
+    risk_tier,
+    borrower_id,
+    credit_score,
+    debt_to_income,
+    delinquencies_2yr,
+    revolving_utilization,
+    risk_score,
+    RANK() OVER (PARTITION BY risk_tier ORDER BY risk_score DESC) AS rank_within_tier
+FROM scored
+QUALIFY rank_within_tier <= 10
+ORDER BY risk_tier, rank_within_tier;
+
+
+-- ── Query 7: Rolling Monthly Default Rate (Time Series) ──────────────────────
+-- Business question: Is the default rate trending up or down over time?
+-- Skills: DATE_TRUNC, window functions (rolling avg), time series analysis
+
+WITH monthly_defaults AS (
+    SELECT
+        DATE_TRUNC('month', issue_date)     AS month,
+        COUNT(*)                            AS loans_issued,
+        SUM(CASE WHEN loan_status IN ('Charged Off','Default') THEN 1 ELSE 0 END)
+                                            AS defaults
+    FROM loans
+    GROUP BY DATE_TRUNC('month', issue_date)
+)
+
+SELECT
+    month,
+    loans_issued,
+    defaults,
+    ROUND(100.0 * defaults / loans_issued, 2)                       AS monthly_default_rate_pct,
+    ROUND(AVG(100.0 * defaults / loans_issued)
+        OVER (ORDER BY month ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), 2)
+                                                                    AS rolling_3mo_avg_pct
+FROM monthly_defaults
+ORDER BY month;
+
+
+-- ── Query 8: Delinquency Cohort Analysis 
+-- Business question: How does past delinquency predict future default?
+-- Skills: CASE WHEN cohorts, JOIN, percentage calculations
+
+SELECT
+    CASE
+        WHEN ch.delinquencies_2yr = 0 THEN '0 delinquencies'
+        WHEN ch.delinquencies_2yr = 1 THEN '1 delinquency'
+        WHEN ch.delinquencies_2yr = 2 THEN '2 delinquencies'
+        ELSE '3+ delinquencies'
+    END                                                             AS delinquency_cohort,
+    COUNT(l.loan_id)                                                AS total_loans,
+    ROUND(AVG(ch.credit_score), 0)                                  AS avg_credit_score,
+    ROUND(AVG(l.interest_rate), 2)                                  AS avg_rate,
+    SUM(CASE WHEN l.loan_status IN ('Charged Off','Default') THEN 1 ELSE 0 END)
+                                                                    AS defaults,
+    ROUND(
+        100.0 * SUM(CASE WHEN l.loan_status IN ('Charged Off','Default') THEN 1 ELSE 0 END)
+        / COUNT(l.loan_id), 2
+    )                                                               AS default_rate_pct
+FROM credit_history ch
+JOIN loans l ON ch.borrower_id = l.borrower_id
+GROUP BY delinquency_cohort
+ORDER BY default_rate_pct DESC;
